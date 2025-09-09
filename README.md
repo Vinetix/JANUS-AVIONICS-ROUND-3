@@ -43,7 +43,7 @@ Core Logic:-
 3.) Telemetry Output:
        ex - Time (IST): 05:31:15 | Lat: 28.613488 | Lon: 77.209030 | Alt: 1030.00 m | State: ASCENT
 
-Question 2
+QUESTION 2
 FEATURES:-
 
   Connect/Disconnect Arduino via browser using Web Serial API.
