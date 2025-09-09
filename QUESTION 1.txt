@@ -1,0 +1,204 @@
+/*
+   CanSat Flight Software - Arduino Uno/Nano
+   -----------------------------------------
+   Features:
+   1. Reads GPS data from Quectel L89HA (or similar GNSS module)
+   2. Parses only $GNGGA and $GNRMC NMEA sentences
+   3. Extracts Time (UTC), Latitude, Longitude, Altitude
+   4. Converts UTC time to IST (UTC +5:30)
+   5. Implements a simple state machine for flight events:
+        - IDLE
+        - ASCENT
+        - APOGEE
+        - DESCENT
+        - PAYLOAD DEPLOYED
+        - LANDED
+   6. Prints clean telemetry to Serial Monitor
+*/
+
+#include <SoftwareSerial.h>
+
+// ------------------- Pin Configuration -------------------
+// GPS module connections (for Arduino Uno/Nano):
+//   GPS TX → Arduino D4 (RX)
+//   GPS RX → Arduino D3 (TX) [optional, only if you send commands]
+SoftwareSerial GPSSerial(4, 3); // RX, TX
+
+// ------------------- Flight State Definitions -------------------
+// Instead of enum, we use #define constants for clarity.
+#define IDLE              0
+#define ASCENT            1
+#define APOGEE            2
+#define DESCENT           3
+#define PAYLOAD_DEPLOYED  4
+#define LANDED            5
+
+int state = IDLE;               // Current state of the CanSat
+double maxAltitude = 0;         // Track maximum altitude reached
+bool payloadDeployed = false;   // Payload deployment flag
+
+// ------------------- GPS Data Variables -------------------
+double latitude = 0.0;          // In decimal degrees
+double longitude = 0.0;         // In decimal degrees
+double altitude = 0.0;          // In meters
+int hourUTC = 0, minuteUTC = 0, secondUTC = 0; // UTC time
+
+// ------------------- Helper: Convert NMEA Lat/Lon -------------------
+// Convert NMEA format (ddmm.mmmm) + direction (N/S/E/W) → decimal degrees
+double convertToDecimal(String raw, String dir) {
+  if (raw.length() < 4) return 0.0;
+
+  double val = raw.toFloat();
+  int degrees = int(val / 100);         // Extract degrees
+  double minutes = val - (degrees * 100); // Extract minutes
+  double decimal = degrees + minutes / 60.0;
+
+  if (dir == "S" || dir == "W") decimal = -decimal; // Apply hemisphere
+  return decimal;
+}
+
+// ------------------- Parse $GNGGA Sentence -------------------
+// Format: $GNGGA,time,lat,N,lon,E,fix,sats,HDOP,alt,units,...
+void parseGGA(String sentence) {
+  String fields[15];
+  int idx = 0;
+
+  // Split CSV fields
+  for (int i = 0; i < sentence.length(); i++) {
+    if (sentence.charAt(i) == ',') idx++;
+    else fields[idx] += sentence.charAt(i);
+  }
+
+  // Time (hhmmss)
+  String utc = fields[1];
+  if (utc.length() >= 6) {
+    hourUTC = utc.substring(0, 2).toInt();
+    minuteUTC = utc.substring(2, 4).toInt();
+    secondUTC = utc.substring(4, 6).toInt();
+  }
+
+  // Latitude & Longitude
+  latitude = convertToDecimal(fields[2], fields[3]);
+  longitude = convertToDecimal(fields[4], fields[5]);
+
+  // Altitude (meters above mean sea level)
+  altitude = fields[9].toFloat();
+}
+
+// ------------------- Parse $GNRMC Sentence -------------------
+// Format: $GNRMC,time,status,lat,N,lon,E,speed,course,date,...
+void parseRMC(String sentence) {
+  String fields[15];
+  int idx = 0;
+
+  // Split CSV fields
+  for (int i = 0; i < sentence.length(); i++) {
+    if (sentence.charAt(i) == ',') idx++;
+    else fields[idx] += sentence.charAt(i);
+  }
+
+  // Time (hhmmss)
+  String utc = fields[1];
+  if (utc.length() >= 6) {
+    hourUTC = utc.substring(0, 2).toInt();
+    minuteUTC = utc.substring(2, 4).toInt();
+    secondUTC = utc.substring(4, 6).toInt();
+  }
+
+  // Latitude & Longitude
+  latitude = convertToDecimal(fields[3], fields[4]);
+  longitude = convertToDecimal(fields[5], fields[6]);
+}
+
+// ------------------- Flight State Machine -------------------
+void updateState() {
+  switch (state) {
+    case IDLE:
+      if (altitude > 5) state = ASCENT; // CanSat lifts off
+      break;
+
+    case ASCENT:
+      if (altitude > maxAltitude) {
+        maxAltitude = altitude;         // Keep tracking max altitude
+      } else if (altitude < maxAltitude - 1) {
+        state = APOGEE;                 // Start descent → APOGEE reached
+      }
+      break;
+
+    case APOGEE:
+      state = DESCENT;                  // Transition to descent
+      break;
+
+    case DESCENT:
+      if (!payloadDeployed && altitude < 0.75 * maxAltitude) {
+        state = PAYLOAD_DEPLOYED;       // Trigger payload deployment
+        payloadDeployed = true;
+      } else if (altitude < 5) {
+        state = LANDED;                 // Touchdown detected
+      }
+      break;
+
+    case PAYLOAD_DEPLOYED:
+      if (altitude < 5) state = LANDED; // Eventually lands
+      break;
+
+    case LANDED:
+      // End state – nothing more to do
+      break;
+  }
+}
+
+// ------------------- Arduino Setup -------------------
+void setup() {
+  Serial.begin(9600);     // Serial monitor (USB)
+  GPSSerial.begin(9600);  // GPS module (default 9600 baud)
+
+  Serial.println("CanSat Flight Software Initialized (Arduino Uno/Nano)");
+}
+
+// ------------------- Arduino Main Loop -------------------
+void loop() {
+  // Read NMEA sentences from GPS
+  if (GPSSerial.available()) {
+    String sentence = GPSSerial.readStringUntil('\n');
+
+    // Parse only the required sentences
+    if (sentence.startsWith("$GNGGA")) {
+      parseGGA(sentence);
+    } else if (sentence.startsWith("$GNRMC")) {
+      parseRMC(sentence);
+    }
+
+    // Update flight state machine
+    updateState();
+
+    // Convert UTC → IST (UTC +5:30)
+    int h = hourUTC, m = minuteUTC, s = secondUTC;
+    m += 30; h += 5;
+    if (m >= 60) { m -= 60; h++; }
+    if (h >= 24) h -= 24;
+
+    // ------------------- Telemetry Output -------------------
+    Serial.print("Time (IST): ");
+    if (h < 10) Serial.print("0");
+    Serial.print(h); Serial.print(":");
+    if (m < 10) Serial.print("0");
+    Serial.print(m); Serial.print(":");
+    if (s < 10) Serial.print("0");
+    Serial.print(s);
+
+    Serial.print(" | Lat: "); Serial.print(latitude, 6);
+    Serial.print(" | Lon: "); Serial.print(longitude, 6);
+    Serial.print(" | Alt: "); Serial.print(altitude, 2);
+    Serial.print(" m | State: ");
+
+    switch (state) {
+      case IDLE: Serial.println("IDLE"); break;
+      case ASCENT: Serial.println("ASCENT"); break;
+      case APOGEE: Serial.println("APOGEE"); break;
+      case DESCENT: Serial.println("DESCENT"); break;
+      case PAYLOAD_DEPLOYED: Serial.println("PAYLOAD DEPLOYED"); break;
+      case LANDED: Serial.println("LANDED"); break;
+    }
+  }
+}
